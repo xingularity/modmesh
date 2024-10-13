@@ -1,7 +1,7 @@
 import os
 import numpy as np
 
-from modmesh import SimpleArrayFloat64
+from modmesh import SimpleArrayUint64, SimpleArrayFloat64
 
 
 __all__ = [
@@ -14,33 +14,60 @@ class TimeSeriesDataFrame(object):
     def __init__(self):
 
         self._columns = list() # Column names
-        self.index_column = None
-        self._data = None
+        self._index_column = None
+        self._index_column_name = None
+        self._data = list()  # List of SimpleArrayFloat64
 
-    def read_from_text_file(self, txt_path: str, delimiter: str=',', time_stamp_included: bool = True):
-        # read the first line as the 
+    def read_from_text_file(
+        self,
+        txt_path: str,
+        delimiter: str=',',
+        timestamp_in_file: bool=True,
+        timestamp_column: str=None
+    ):
+        """
+        Generate dataframe from a text file.
+
+        :param txt_path: path to the text file.
+        :type txt_path: str
+        :param delimiter: delimiter.
+        :type delimiter: str
+        :param timestamp_in_file: If the text file containing index column, expected to be integer.
+        :type timestamp_in_file: bool
+        :prarm timestamp_column: Column which stores timestamp data.
+        :type timestamp_column: str
+        :return None
+        """
         if not os.path.exists(txt_path):
             raise Exception("Text file '{}' does not exist".format(txt_path))
         
-        # read the first line as columns and assuming the first column is timestamp
-        with open(txt_path, 'r') as f:
-            if time_stamp_included:
-                # remove all leading/tail spaces in the column names
-                self._columns = [x.strip() for x in f.readline().strip().split(delimiter)]
-                self.index_column = self._columns[0]
-            else:
-                # remove all leading/tail spaces in the column names
-                self._columns = [x.strip() for x in f.readline().strip().split(delimiter)]
+        nd_arr = np.genfromtxt(txt_path, delimiter=delimiter)[1:]
+        index_column_num = 0 if timestamp_in_file is not None else None # default treat 0th column as the index column
         
-        nd_arr = np.genfromtxt(txt_path, delimiter=delimiter)[1:] # remove the first row which is the table header
-        self._data = SimpleArrayFloat64(array=nd_arr)
+        with open(txt_path, 'r') as f:
+            table_header = [x.strip() for x in f.readline().strip().split(delimiter)]
+            if timestamp_in_file:
+                if timestamp_column in table_header:
+                    index_column_num = table_header.index(timestamp_column)
+                # If timestamp_column is None or not in table header, default treat 0th column as the index column
+                self._index_column = SimpleArrayUint64(nd_arr[:, index_column_num].astype(np.uintc))
+                self._index_column_name = table_header[index_column_num]
+            else:
+                self._index_column = SimpleArrayUint64(np.arange(nd_arr.shape[0] - 1).astype(np.uintc))
+                self._index_column_name = "Index"
+            self._columns = table_header
+            if index_column_num is not None:
+                self._columns.pop(index_column_num)
+
+        for i in range(nd_arr.shape[1]):
+            if i == index_column_num:
+                continue
+            self._data.append(SimpleArrayFloat64(array=nd_arr[:, i]))
 
     def get_column(self, column_name:str):
         if column_name not in self._columns:
             raise Exception("Column '{}' does not exist".format(column_name))
-        index = self._columns.index(column_name)
-
-        return self._data.ndarray[index]
+        return self._data[self._columns.index(column_name)].ndarray
 
     @property
     def columns(self):
