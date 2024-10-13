@@ -13,7 +13,7 @@ class TimeSeriesDataFrame(object):
     
     def __init__(self):
 
-        self.columns = list() # Column names
+        self._columns = list() # Column names
         self.inex_column = None
         self._data = None
 
@@ -26,11 +26,22 @@ class TimeSeriesDataFrame(object):
         with open(txt_path, 'r') as f:
             if time_stamp_included:
                 # remove all leading/tail spaces in the column names
-                self.columns = [x.strip() for x in f.readline().strip().split(delimiter)]
-                self.inex_column = self.columns[0]
+                self._columns = [x.strip() for x in f.readline().strip().split(delimiter)]
+                self.inex_column = self._columns[0]
             else:
                 # remove all leading/tail spaces in the column names
-                self.columns = [x.strip() for x in f.readline().strip().split(delimiter)]
+                self._columns = [x.strip() for x in f.readline().strip().split(delimiter)]
         
         nd_arr = np.genfromtxt(txt_path, delimiter=delimiter)[1:] # remove the first row which is the table header
         self._data = SimpleArrayFloat64(array=nd_arr)
+
+    def get_column(self, column_name:str):
+        if column_name not in self._columns:
+            raise Exception("Column '{}' does not exist".format(column_name))
+        index = self._columns.index(column_name)
+
+        return self._data.ndarray[index]
+
+    @property
+    def columns(self):
+        return self._columns
