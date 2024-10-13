@@ -14,7 +14,7 @@ class TimeSeriesDataFrame(object):
     def __init__(self):
 
         self._columns = list() # Column names
-        self.inex_column = None
+        self.index_column = None
         self._data = None
 
     def read_from_text_file(self, txt_path: str, delimiter: str=',', time_stamp_included: bool = True):
@@ -27,7 +27,7 @@ class TimeSeriesDataFrame(object):
             if time_stamp_included:
                 # remove all leading/tail spaces in the column names
                 self._columns = [x.strip() for x in f.readline().strip().split(delimiter)]
-                self.inex_column = self._columns[0]
+                self.index_column = self._columns[0]
             else:
                 # remove all leading/tail spaces in the column names
                 self._columns = [x.strip() for x in f.readline().strip().split(delimiter)]
