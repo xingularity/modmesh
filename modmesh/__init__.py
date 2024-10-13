@@ -41,6 +41,8 @@ from . import spacetime  # noqa: F401
 from . import onedim  # noqa: F401
 from . import system  # noqa: F401
 from . import toggle  # noqa: F401
+from . import timeseries_dataframe
+from .timeseries_dataframe import *
 
 
 clinfo = core.ProcessInfo.instance.command_line
