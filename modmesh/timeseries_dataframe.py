@@ -69,18 +69,18 @@ class TimeSeriesDataFrame(object):
             raise Exception("Text file '{}' does not exist".format(txt_path))
         
         nd_arr = np.genfromtxt(txt_path, delimiter=delimiter)[1:]
-        index_column_num = 0 if timestamp_in_file is not None else None # default treat 0th column as the index column
+        index_column_num = 0 if timestamp_in_file else None # default treat 0th column as the index column
         
         with open(txt_path, 'r') as f:
-            table_header = [x.strip() for x in f.readline().strip().split(delimiter)]
+            table_header = [x for x in f.readline().strip().split(delimiter)]
             if timestamp_in_file:
                 if timestamp_column in table_header:
                     index_column_num = table_header.index(timestamp_column)
                 # If timestamp_column is None or not in table header, default treat 0th column as the index column
-                self._index_column = SimpleArrayUint64(nd_arr[:, index_column_num].astype(np.uintc))
+                self._index_column = SimpleArrayUint64(array=nd_arr[:, index_column_num].astype(np.uint64))
                 self._index_column_name = table_header[index_column_num]
             else:
-                self._index_column = SimpleArrayUint64(np.arange(nd_arr.shape[0] - 1).astype(np.uintc))
+                self._index_column = SimpleArrayUint64(array=np.arange(nd_arr.shape[0]).astype(np.uint64))
                 self._index_column_name = "Index"
             self._columns = table_header
             if index_column_num is not None:
