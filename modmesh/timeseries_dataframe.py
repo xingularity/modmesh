@@ -28,7 +28,7 @@
 import os
 import numpy as np
 
-from modmesh import SimpleArrayUint64, SimpleArrayFloat64
+from .core import SimpleArrayUint64, SimpleArrayFloat64
 
 
 __all__ = [
@@ -47,10 +47,10 @@ class TimeSeriesDataFrame(object):
 
     def read_from_text_file(
         self,
-        txt_path: str,
-        delimiter: str=',',
-        timestamp_in_file: bool=True,
-        timestamp_column: str=None
+        txt_path,
+        delimiter=',',
+        timestamp_in_file=True,
+        timestamp_column=None
     ):
         """
         Generate dataframe from a text file.
@@ -91,7 +91,7 @@ class TimeSeriesDataFrame(object):
                 continue
             self._data.append(SimpleArrayFloat64(array=nd_arr[:, i]))
 
-    def get_column(self, column_name:str):
+    def get_column(self, column_name):
         if column_name not in self._columns:
             raise Exception("Column '{}' does not exist".format(column_name))
         return self._data[self._columns.index(column_name)].ndarray
