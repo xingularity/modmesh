@@ -59,7 +59,8 @@ class TimeSeriesDataFrame(object):
         :type txt_path: str
         :param delimiter: delimiter.
         :type delimiter: str
-        :param timestamp_in_file: If the text file containing index column, expected to be integer.
+        :param timestamp_in_file: If the text file containing index column,
+        expected to be integer.
         :type timestamp_in_file: bool
         :prarm timestamp_column: Column which stores timestamp data.
         :type timestamp_column: str
@@ -67,10 +68,10 @@ class TimeSeriesDataFrame(object):
         """
         if not os.path.exists(txt_path):
             raise Exception("Text file '{}' does not exist".format(txt_path))
-        
+
         nd_arr = np.genfromtxt(txt_path, delimiter=delimiter)[1:]
         index_column_num = 0 if timestamp_in_file else None
-        
+
         with open(txt_path, 'r') as f:
             table_header = [x for x in f.readline().strip().split(delimiter)]
             if timestamp_in_file:
