@@ -103,3 +103,7 @@ class TimeSeriesDataFrame(object):
     @property
     def columns(self):
         return self._columns
+
+    @property
+    def shape(self):
+        return (self._index_column.ndarray.shape[0], len(self._data))
