@@ -86,20 +86,20 @@ class TimeSeriesDataFrame(object):
                     array=np.arange(nd_arr.shape[0]).astype(np.uint64)
                 )
                 self._index_column_name = "Index"
+
             self._columns = table_header
             if index_column_num is not None:
                 self._columns.pop(index_column_num)
 
         for i in range(nd_arr.shape[1]):
-            if i == index_column_num:
-                continue
-            self._data.append(SimpleArrayFloat64(array=nd_arr[:, i]))
+            if i != index_column_num:
+                self._data.append(SimpleArrayFloat64(array=nd_arr[:, i].copy()))
 
-    def get_column(self, column_name):
+    def __getitem__(self, column_name):
         if column_name not in self._columns:
             raise Exception("Column '{}' does not exist".format(column_name))
         return self._data[self._columns.index(column_name)].ndarray
-
+        
     @property
     def columns(self):
         return self._columns
@@ -107,3 +107,7 @@ class TimeSeriesDataFrame(object):
     @property
     def shape(self):
         return (self._index_column.ndarray.shape[0], len(self._data))
+
+    @property
+    def index(self):
+        return self._index_column.ndarray
