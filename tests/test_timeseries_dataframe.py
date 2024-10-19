@@ -107,7 +107,9 @@ class TimeSeriesDataFrameTC(unittest.TestCase):
             os.path.join(self.DATADIR, "dlc_trimmed.csv"), delimiter=','
         )[1:]
 
-        self.assertEqual(list(tsdf.index), list(nd_arr[:, 0].astype(np.uint64)))
+        self.assertEqual(
+            list(tsdf.index), list(nd_arr[:, 0].astype(np.uint64))
+        )
 
     def test_dataframe_get_column(self):
         tsdf = TimeSeriesDataFrame()
