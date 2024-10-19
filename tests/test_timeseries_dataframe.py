@@ -102,7 +102,7 @@ class TimeSeriesDataFrameTC(unittest.TestCase):
         tsdf.read_from_text_file(
             os.path.join(self.DATADIR, "dlc_trimmed.csv")
         )
-        
+
         nd_arr = np.genfromtxt(
             os.path.join(self.DATADIR, "dlc_trimmed.csv"), delimiter=','
         )[1:]
@@ -114,7 +114,7 @@ class TimeSeriesDataFrameTC(unittest.TestCase):
         tsdf.read_from_text_file(
             os.path.join(self.DATADIR, "dlc_trimmed.csv")
         )
-        
+
         one_column_data = tsdf['DATA_DELTA_VEL[1] ']
 
         nd_arr = np.genfromtxt(

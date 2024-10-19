@@ -93,13 +93,15 @@ class TimeSeriesDataFrame(object):
 
         for i in range(nd_arr.shape[1]):
             if i != index_column_num:
-                self._data.append(SimpleArrayFloat64(array=nd_arr[:, i].copy()))
+                self._data.append(
+                    SimpleArrayFloat64(array=nd_arr[:, i].copy())
+                )
 
     def __getitem__(self, column_name):
         if column_name not in self._columns:
             raise Exception("Column '{}' does not exist".format(column_name))
         return self._data[self._columns.index(column_name)].ndarray
-        
+
     @property
     def columns(self):
         return self._columns
