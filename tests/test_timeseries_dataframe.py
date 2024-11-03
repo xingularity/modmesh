@@ -105,7 +105,6 @@ class TimeSeriesDataFrame(object):
             if index_column_num is not None:
                 self._columns.pop(index_column_num)
 
-
             for i in range(nd_arr.shape[1]):
                 if i != index_column_num:
                     self._data.append(
