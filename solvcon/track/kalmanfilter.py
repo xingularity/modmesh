@@ -1,0 +1,440 @@
+# Copyright (c) 2026, Stephen Xie <zonghanxie@proton.me>
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# 1. Redistributions of source code must retain the above copyright notice,
+#    this list of conditions and the following disclaimer.
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+#    this list of conditions and the following disclaimer in the documentation
+#    and/or other materials provided with the distribution.
+# 3. Neither the name of the copyright holder nor the names of its
+#    contributors may be used to endorse or promote products derived from this
+#    software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+# "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+# TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+# PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR
+# CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+# EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+# PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA,
+# OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+# LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+# NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE,
+# EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+"""
+Kalman filter predict (time-update) step for strapdown inertial navigation
+in the Earth-centered Earth-fixed (ECEF) frame, built on top of the C++
+``modmesh.KalmanFilterFp64`` class.
+
+This module is tailored to the Blue Origin Deorbit, Descent, and Landing
+Tipping Point (BODDL-TP) NASA dataset:
+
+* Position ``p`` and velocity ``v`` are expressed in the ECEF frame, in
+  meters and meters per second.
+* Attitude is represented by a unit quaternion ``q`` that rotates vectors
+  from the vehicle center-of-navigation (CON) body frame to ECEF.  The
+  Breckenridge convention (``i^2 = j^2 = k^2 = -1``, ``ijk = +1``) is used
+  with the scalar component stored last: ``q = [q_v0, q_v1, q_v2, q_s]``.
+* IMU inputs are the integrated delta-velocity and delta-angle of the DLC
+  IMU over one sampling interval, both in body coordinates.
+
+The underlying C++ filter is linear -- it evolves the state as
+``x_{k+1} = F x_k + B u_k`` with a fixed ``F`` and ``B``.  The nonlinear
+strapdown mechanization (body-frame specific force rotated into ECEF,
+two-body + J2 gravity, and body-to-ECEF quaternion composition) is folded
+into the control input ``u`` each step, while the time-invariant Coriolis
+and centrifugal terms are baked into ``F``.
+
+The propagated state vector is
+
+    x = [p_x, p_y, p_z, v_x, v_y, v_z, q_v0, q_v1, q_v2, q_s]   (shape 10,)
+
+and the covariance is the 10x10 covariance of this same state.
+"""
+
+import numpy as np
+
+from .. import SimpleArrayFloat64
+from .. import KalmanFilterFp64
+
+
+__all__ = [
+    "EARTH_RATE",
+    "WGS84_GM",
+    "WGS84_SEMI_MAJOR",
+    "WGS84_J2",
+    "InertialKalmanFilter",
+]
+
+
+EARTH_RATE = 7.2921150e-5
+"""Earth sidereal rotation rate (rad/s)."""
+
+WGS84_GM = 3.986004418e14
+"""WGS-84 Earth gravitational constant (m^3/s^2)."""
+
+WGS84_SEMI_MAJOR = 6378137.0
+"""WGS-84 equatorial radius (m)."""
+
+WGS84_J2 = 1.0826267e-3
+"""WGS-84 second zonal harmonic (dimensionless)."""
+
+
+STATE_DIM = 10
+CONTROL_DIM = 10
+
+
+def _skew(v):
+    """
+    Build the 3x3 skew-symmetric cross-product matrix of a 3-vector.
+
+    :param v: Three-element vector.
+    :type v: numpy.ndarray
+    :return: Matrix ``[v]x`` such that ``[v]x @ u == numpy.cross(v, u)``.
+    :rtype: numpy.ndarray
+    """
+    return np.array([
+        [0.0, -v[2], v[1]],
+        [v[2], 0.0, -v[0]],
+        [-v[1], v[0], 0.0],
+    ])
+
+
+def quat_identity():
+    """
+    Return the Breckenridge identity quaternion (scalar stored last).
+
+    :return: Array ``[0, 0, 0, 1]``.
+    :rtype: numpy.ndarray
+    """
+    return np.array([0.0, 0.0, 0.0, 1.0])
+
+
+def quat_multiply(q1, q2):
+    """
+    Multiply two Breckenridge quaternions ``q1 (x) q2`` with scalar last.
+
+    Because Breckenridge sets ``ijk = +1``, the cross-product term of the
+    vector component carries the opposite sign to the Hamilton form.
+
+    :param q1: Left quaternion ``[v0, v1, v2, s]``.
+    :type q1: numpy.ndarray
+    :param q2: Right quaternion ``[v0, v1, v2, s]``.
+    :type q2: numpy.ndarray
+    :return: Composed quaternion ``[v0, v1, v2, s]``.
+    :rtype: numpy.ndarray
+    """
+    v1 = np.asarray(q1[0:3], dtype=float)
+    s1 = float(q1[3])
+    v2 = np.asarray(q2[0:3], dtype=float)
+    s2 = float(q2[3])
+
+    s = s1 * s2 - float(np.dot(v1, v2))
+    v = s1 * v2 + s2 * v1 - np.cross(v1, v2)
+    return np.array([v[0], v[1], v[2], s])
+
+
+def quat_to_dcm(q):
+    """
+    Convert a Breckenridge quaternion into the DCM rotating a vector from
+    the body frame to the reference (ECEF) frame.
+
+    :param q: Unit quaternion ``[v0, v1, v2, s]``.
+    :type q: numpy.ndarray
+    :return: 3x3 body-to-reference rotation matrix.
+    :rtype: numpy.ndarray
+    """
+    v = np.asarray(q[0:3], dtype=float)
+    s = float(q[3])
+    vv = float(np.dot(v, v))
+    return (s * s - vv) * np.eye(3) + 2.0 * np.outer(v, v) - 2.0 * s * _skew(v)
+
+
+def rotvec_to_quat(theta):
+    """
+    Convert a rotation vector (axis times angle) into a Breckenridge
+    quaternion with scalar last.
+
+    :param theta: Rotation vector in radians, shape ``(3,)``.
+    :type theta: numpy.ndarray
+    :return: Unit quaternion ``[v0, v1, v2, s]``.
+    :rtype: numpy.ndarray
+    """
+    theta = np.asarray(theta, dtype=float)
+    angle = float(np.linalg.norm(theta))
+    if angle < 1.0e-12:
+        half = 0.5 * theta
+        scalar = 1.0 - 0.125 * float(np.dot(theta, theta))
+        return np.array([half[0], half[1], half[2], scalar])
+    half = 0.5 * angle
+    axis = theta / angle
+    sin_half = np.sin(half)
+    return np.array([
+        axis[0] * sin_half,
+        axis[1] * sin_half,
+        axis[2] * sin_half,
+        np.cos(half),
+    ])
+
+
+def _build_transition_matrix(dt, earth_rate, include_centrifugal):
+    """
+    Assemble the 10x10 linear state-transition matrix ``F``.
+
+    The linear, time-invariant pieces of the ECEF strapdown dynamics are
+    baked in:
+
+    * ``p_{k+1} = p_k + v_k * dt``
+    * ``v_{k+1} = v_k - 2 [omega_ie]x v_k * dt``    (Coriolis)
+    * ``v_{k+1} += [omega_ie^2 diag] p_k * dt``     (centrifugal)
+
+    The quaternion block is the identity; the actual body-to-ECEF rotation
+    increment is supplied through the control input ``u``.
+
+    :param dt: IMU sampling interval (s).
+    :type dt: float
+    :param earth_rate: Scalar Earth rotation rate (rad/s).
+    :type earth_rate: float
+    :param include_centrifugal: Include the ``-omega x (omega x p)`` term.
+    :type include_centrifugal: bool
+    :return: 10x10 state-transition matrix.
+    :rtype: numpy.ndarray
+    """
+    f_mat = np.eye(STATE_DIM)
+    f_mat[0:3, 3:6] = np.eye(3) * dt
+    omega_vec = np.array([0.0, 0.0, earth_rate])
+    f_mat[3:6, 3:6] = np.eye(3) - 2.0 * _skew(omega_vec) * dt
+    if include_centrifugal:
+        omega_sq = earth_rate * earth_rate
+        f_mat[3:6, 0:3] = np.diag([omega_sq, omega_sq, 0.0]) * dt
+    return f_mat
+
+
+class InertialKalmanFilter:
+    """
+    Strapdown Kalman-filter predictor in ECEF, wrapping ``KalmanFilterFp64``.
+
+    Each call to :meth:`predict` consumes one IMU sample (delta-velocity and
+    delta-angle in the body frame over ``dt``), composes the corresponding
+    control input ``u``, and delegates the linear propagation to the C++
+    :class:`modmesh.KalmanFilterFp64` instance.
+
+    :ivar dt: Fixed IMU sampling interval (s).
+    :vartype dt: float
+    :ivar earth_rate: Earth rotation rate (rad/s).
+    :vartype earth_rate: float
+    :ivar use_j2: Whether to include the J2 term in the gravity model.
+    :vartype use_j2: bool
+    :ivar include_centrifugal: Whether to include the centrifugal term.
+    :vartype include_centrifugal: bool
+    :ivar filter: Underlying C++ Kalman filter.
+    :vartype filter: modmesh.KalmanFilterFp64
+    """
+
+    def __init__(
+        self,
+        initial_state,
+        dt,
+        earth_rate=EARTH_RATE,
+        process_noise=1.0e-3,
+        measurement_noise=1.0,
+        jitter=1.0e-9,
+        use_j2=True,
+        include_centrifugal=True,
+    ):
+        """
+        Build the filter around a fixed IMU rate.
+
+        :param initial_state: Initial 10-element state ``[p, v, q]`` where
+            ``q`` is the Breckenridge body-to-ECEF quaternion with scalar
+            last.  Must be non-zero in its quaternion slice.
+        :type initial_state: numpy.ndarray
+        :param dt: IMU sampling interval in seconds (must be positive).
+        :type dt: float
+        :param earth_rate: Scalar Earth rotation rate (rad/s).
+        :type earth_rate: float
+        :param process_noise: Process noise standard deviation forwarded to
+            ``KalmanFilterFp64`` (``Q = process_noise**2 * I``).
+        :type process_noise: float
+        :param measurement_noise: Measurement noise standard deviation; the
+            predict-only workflow does not use it but the C++ constructor
+            requires a value.
+        :type measurement_noise: float
+        :param jitter: Numerical jitter added to the innovation covariance
+            by the C++ filter during updates.
+        :type jitter: float
+        :param use_j2: Include the J2 zonal term in the gravity model.
+        :type use_j2: bool
+        :param include_centrifugal: Include centrifugal acceleration.
+        :type include_centrifugal: bool
+        """
+        dt = float(dt)
+        if dt <= 0.0:
+            raise ValueError("dt must be strictly positive")
+
+        state = np.asarray(initial_state, dtype=float).copy()
+        if state.shape != (STATE_DIM,):
+            raise ValueError(
+                f"initial_state must have shape ({STATE_DIM},), "
+                f"got {state.shape}"
+            )
+        qnorm = float(np.linalg.norm(state[6:10]))
+        if qnorm == 0.0:
+            raise ValueError("initial quaternion has zero norm")
+        state[6:10] /= qnorm
+
+        self.dt = dt
+        self.earth_rate = float(earth_rate)
+        self.use_j2 = bool(use_j2)
+        self.include_centrifugal = bool(include_centrifugal)
+
+        self._f_matrix = _build_transition_matrix(
+            self.dt, self.earth_rate, self.include_centrifugal
+        )
+        self._b_matrix = np.eye(STATE_DIM, CONTROL_DIM)
+
+        # A 1x10 placeholder H keeps the C++ constructor satisfied; the
+        # update step is never invoked by this wrapper.
+        h_mat = np.zeros((1, STATE_DIM))
+
+        self.filter = KalmanFilterFp64(
+            x=SimpleArrayFloat64(array=state),
+            f=SimpleArrayFloat64(array=self._f_matrix),
+            b=SimpleArrayFloat64(array=self._b_matrix),
+            h=SimpleArrayFloat64(array=h_mat),
+            process_noise=float(process_noise),
+            measurement_noise=float(measurement_noise),
+            jitter=float(jitter),
+        )
+
+    @property
+    def state(self):
+        """
+        Return a copy of the current 10-element mean state vector.
+
+        :return: Array ``[p (3), v (3), q (4)]``.
+        :rtype: numpy.ndarray
+        """
+        return self.filter.state.ndarray.copy()
+
+    @property
+    def covariance(self):
+        """
+        Return a copy of the current 10x10 state covariance matrix.
+
+        :return: Covariance matrix.
+        :rtype: numpy.ndarray
+        """
+        return self.filter.covariance.ndarray.copy()
+
+    @property
+    def position(self):
+        """Position vector in ECEF (m)."""
+        return self.state[0:3]
+
+    @property
+    def velocity(self):
+        """Velocity vector in ECEF (m/s)."""
+        return self.state[3:6]
+
+    @property
+    def quaternion(self):
+        """Body-to-ECEF quaternion ``[v0, v1, v2, s]``."""
+        return self.state[6:10]
+
+    def gravity(self, position):
+        """
+        Evaluate ECEF gravitational acceleration at ``position``.
+
+        The model is two-body gravity plus an optional J2 zonal-harmonic
+        term.  The centrifugal acceleration is not included here because
+        that term is handled by the linear part of ``F``.
+
+        :param position: ECEF position vector (m).
+        :type position: numpy.ndarray
+        :return: Gravitational acceleration in ECEF (m/s^2).
+        :rtype: numpy.ndarray
+        """
+        position = np.asarray(position, dtype=float)
+        r = float(np.linalg.norm(position))
+        if r <= 0.0:
+            return np.zeros(3)
+
+        x, y, z = position
+        base = -WGS84_GM / (r ** 3)
+        if not self.use_j2:
+            return base * position
+
+        zr2 = (z / r) ** 2
+        ar2 = (WGS84_SEMI_MAJOR / r) ** 2
+        c = 1.5 * WGS84_J2 * ar2
+        return np.array([
+            base * x * (1.0 - c * (5.0 * zr2 - 1.0)),
+            base * y * (1.0 - c * (5.0 * zr2 - 1.0)),
+            base * z * (1.0 - c * (5.0 * zr2 - 3.0)),
+        ])
+
+    def predict(self, delta_vel_body, delta_angle_body):
+        """
+        Run one predict step using IMU delta-velocity and delta-angle.
+
+        The control input passed to the C++ filter is assembled as
+
+            u[0:3] = 0.5 * dt * (dv_ecef + g * dt)
+            u[3:6] = dv_ecef + g * dt
+            u[6:10] = q_k (x) dq(delta_theta_eb_body) - q_k
+
+        where ``dv_ecef = R_b^e(q_k) @ delta_vel_body`` is the integrated
+        specific force rotated into ECEF, ``g`` is the gravity model,
+        ``delta_theta_eb_body = delta_angle_body - R_e^b @ omega_ie * dt``
+        is the body-frame rotation increment relative to ECEF (with Earth
+        rotation subtracted), and ``dq`` is the Breckenridge quaternion of
+        that increment.  Adding ``F x_k`` then produces
+
+            p -> p + v*dt + 0.5 * a_nl * dt^2
+            v -> v - 2 omega x v * dt + [centrifugal] * dt + a_nl * dt
+            q -> q (x) dq
+
+        which is the ECEF strapdown mechanization with gravity, Coriolis,
+        and (optionally) centrifugal acceleration.
+
+        :param delta_vel_body: Integrated specific force over ``dt`` in the
+            body frame (m/s), shape ``(3,)``.
+        :type delta_vel_body: numpy.ndarray
+        :param delta_angle_body: Integrated angular rate over ``dt`` in the
+            body frame (rad), shape ``(3,)``.
+        :type delta_angle_body: numpy.ndarray
+        :return: Updated 10-element state vector (copy).
+        :rtype: numpy.ndarray
+        """
+        delta_vel_body = np.asarray(delta_vel_body, dtype=float).reshape(3)
+        delta_angle_body = np.asarray(delta_angle_body, dtype=float).reshape(3)
+
+        x_k = self.state
+        p_k = x_k[0:3]
+        q_k = x_k[6:10]
+
+        dcm_be = quat_to_dcm(q_k)
+        dcm_eb = dcm_be.T
+        omega_ie = np.array([0.0, 0.0, self.earth_rate])
+
+        dv_ecef = dcm_be @ delta_vel_body
+        g = self.gravity(p_k)
+
+        delta_theta_eb_body = delta_angle_body - dcm_eb @ omega_ie * self.dt
+        dq = rotvec_to_quat(delta_theta_eb_body)
+        q_new = quat_multiply(q_k, dq)
+        q_new /= np.linalg.norm(q_new)
+
+        u = np.zeros(CONTROL_DIM)
+        u[0:3] = 0.5 * self.dt * (dv_ecef + g * self.dt)
+        u[3:6] = dv_ecef + g * self.dt
+        u[6:10] = q_new - q_k
+
+        self.filter.predict(SimpleArrayFloat64(array=u))
+        return self.state
+
+# vim: set ff=unix fenc=utf8 et sw=4 ts=4 sts=4:
