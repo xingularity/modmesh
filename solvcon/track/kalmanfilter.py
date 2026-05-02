@@ -437,4 +437,190 @@ class InertialKalmanFilter:
         self.filter.predict(SimpleArrayFloat64(array=u))
         return self.state
 
+
+def _initial_state_from_event(gt_event):
+    """
+    Build a 10-element state vector from a ground-truth event.
+
+    :param gt_event: Ground-truth event reference.
+    :type gt_event: modmesh.track.dataset.EventReference
+    :return: Initial state ``[p (3), v (3), q (4)]``.
+    :rtype: numpy.ndarray
+    """
+    data = gt_event.data
+    return np.array([
+        data["truth_pos_CON_ECEF_ECEF_M[1]"],
+        data["truth_pos_CON_ECEF_ECEF_M[2]"],
+        data["truth_pos_CON_ECEF_ECEF_M[3]"],
+        data["truth_vel_CON_ECEF_ECEF_MpS[1]"],
+        data["truth_vel_CON_ECEF_ECEF_MpS[2]"],
+        data["truth_vel_CON_ECEF_ECEF_MpS[3]"],
+        data["truth_quat_CON2ECEF[1]"],
+        data["truth_quat_CON2ECEF[2]"],
+        data["truth_quat_CON2ECEF[3]"],
+        data["truth_quat_CON2ECEF[4]"],
+    ], dtype=float)
+
+
+def _imu_increments(imu_event):
+    """
+    Extract delta-velocity and delta-angle vectors from an IMU event.
+
+    :param imu_event: IMU event reference.
+    :type imu_event: modmesh.track.dataset.EventReference
+    :return: Tuple ``(delta_vel_body, delta_angle_body)``.
+    :rtype: tuple[numpy.ndarray, numpy.ndarray]
+    """
+    data = imu_event.data
+    dv = np.array([
+        data["DATA_DELTA_VEL[1]"],
+        data["DATA_DELTA_VEL[2]"],
+        data["DATA_DELTA_VEL[3]"],
+    ], dtype=float)
+    da = np.array([
+        data["DATA_DELTA_ANGLE[1]"],
+        data["DATA_DELTA_ANGLE[2]"],
+        data["DATA_DELTA_ANGLE[3]"],
+    ], dtype=float)
+    return dv, da
+
+
+def _gt_pos_vel(gt_event):
+    """
+    Extract ground-truth position and velocity vectors from an event.
+
+    :param gt_event: Ground-truth event reference.
+    :type gt_event: modmesh.track.dataset.EventReference
+    :return: Tuple ``(position, velocity)`` in ECEF.
+    :rtype: tuple[numpy.ndarray, numpy.ndarray]
+    """
+    data = gt_event.data
+    p = np.array([
+        data["truth_pos_CON_ECEF_ECEF_M[1]"],
+        data["truth_pos_CON_ECEF_ECEF_M[2]"],
+        data["truth_pos_CON_ECEF_ECEF_M[3]"],
+    ], dtype=float)
+    v = np.array([
+        data["truth_vel_CON_ECEF_ECEF_MpS[1]"],
+        data["truth_vel_CON_ECEF_ECEF_MpS[2]"],
+        data["truth_vel_CON_ECEF_ECEF_MpS[3]"],
+    ], dtype=float)
+    return p, v
+
+
+def main():
+    """
+    Load IMU and ground-truth data, run KF predict, and plot the results.
+
+    The first ground-truth event seeds ``[p, v, q]`` for the filter; ``dt``
+    is derived from the first two IMU timestamps after that seed.  The
+    filter is then propagated through every IMU sample, and the predicted
+    position and velocity in ECEF are plotted against the ground-truth
+    samples encountered along the timeline.
+    """
+    import ssl
+    import matplotlib.pyplot as plt
+
+    from modmesh.track import dataset as dataset_mod
+
+    ssl._create_default_https_context = ssl._create_stdlib_context
+    dataset_obj = dataset_mod.NasaDataset(
+        "https://techport.nasa.gov/api/file/presignedUrl/380503",
+        "DDL-F1_Dataset-20201013.zip",
+    )
+    dataset_obj.download()
+    dataset_obj.extract()
+    dataset_obj.load()
+
+    gt_start = next(
+        (ev for ev in dataset_obj.events if ev.source == "ground_truth"),
+        None,
+    )
+    if gt_start is None:
+        raise RuntimeError("dataset contains no ground-truth events")
+
+    imu_times_ns = [
+        ev.timestamp
+        for ev in dataset_obj.events
+        if ev.source == "imu" and ev.timestamp >= gt_start.timestamp
+    ]
+    if len(imu_times_ns) < 2:
+        raise RuntimeError("not enough IMU samples to estimate dt")
+    dt = (imu_times_ns[1] - imu_times_ns[0]) * 1.0e-9
+
+    kf = InertialKalmanFilter(
+        initial_state=_initial_state_from_event(gt_start),
+        dt=dt,
+    )
+
+    t0 = gt_start.timestamp * 1.0e-9
+    pred_t = [0.0]
+    pred_p = [kf.position.copy()]
+    pred_v = [kf.velocity.copy()]
+    gt_t = [0.0]
+    gt_p0, gt_v0 = _gt_pos_vel(gt_start)
+    gt_p = [gt_p0]
+    gt_v = [gt_v0]
+
+    for ev in dataset_obj.events:
+        if ev.timestamp < gt_start.timestamp:
+            continue
+        if ev.source == "imu":
+            dv, da = _imu_increments(ev)
+            kf.predict(dv, da)
+            pred_t.append(ev.timestamp * 1.0e-9 - t0)
+            pred_p.append(kf.position.copy())
+            pred_v.append(kf.velocity.copy())
+        elif ev.source == "ground_truth" and ev is not gt_start:
+            p, v = _gt_pos_vel(ev)
+            gt_t.append(ev.timestamp * 1.0e-9 - t0)
+            gt_p.append(p)
+            gt_v.append(v)
+
+    pred_t = np.asarray(pred_t)
+    pred_p = np.asarray(pred_p)
+    pred_v = np.asarray(pred_v)
+    gt_t = np.asarray(gt_t)
+    gt_p = np.asarray(gt_p)
+    gt_v = np.asarray(gt_v)
+
+    fig, axes = plt.subplots(3, 2, figsize=(12, 9), sharex=True)
+    axis_names = ("X", "Y", "Z")
+    for i, name in enumerate(axis_names):
+        axes[i, 0].plot(
+            gt_t, gt_p[:, i],
+            "k.", markersize=2, label="ground truth",
+        )
+        axes[i, 0].plot(
+            pred_t, pred_p[:, i],
+            "b-", linewidth=0.7, label="KF predict",
+        )
+        axes[i, 0].set_ylabel(f"p_{name} (m)")
+        axes[i, 0].grid(True)
+        axes[i, 0].legend(loc="best", fontsize=8)
+
+        axes[i, 1].plot(
+            gt_t, gt_v[:, i],
+            "k.", markersize=2, label="ground truth",
+        )
+        axes[i, 1].plot(
+            pred_t, pred_v[:, i],
+            "r-", linewidth=0.7, label="KF predict",
+        )
+        axes[i, 1].set_ylabel(f"v_{name} (m/s)")
+        axes[i, 1].grid(True)
+        axes[i, 1].legend(loc="best", fontsize=8)
+
+    axes[0, 0].set_title("ECEF position")
+    axes[0, 1].set_title("ECEF velocity")
+    axes[2, 0].set_xlabel("time since first ground-truth (s)")
+    axes[2, 1].set_xlabel("time since first ground-truth (s)")
+    fig.suptitle("KF predict vs. NASA ground truth")
+    fig.tight_layout()
+    plt.show()
+
+
+if __name__ == "__main__":
+    main()
+
 # vim: set ff=unix fenc=utf8 et sw=4 ts=4 sts=4:
