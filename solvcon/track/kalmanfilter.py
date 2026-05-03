@@ -42,11 +42,15 @@ Tipping Point (BODDL-TP) NASA dataset:
   IMU over one sampling interval, both in body coordinates.
 
 The underlying C++ filter is linear -- it evolves the state as
-``x_{k+1} = F x_k + B u_k`` with a fixed ``F`` and ``B``.  The nonlinear
-strapdown mechanization (body-frame specific force rotated into ECEF,
-two-body + J2 gravity, and body-to-ECEF quaternion composition) is folded
-into the control input ``u`` each step, while the time-invariant Coriolis
-and centrifugal terms are baked into ``F``.
+``x_{k+1} = F x_k + B u_k`` with a fixed ``F`` and ``B``.  Because the IMU
+sample interval ``dt`` may vary between samples, every dt-dependent linear
+piece of the strapdown dynamics (translation ``v*dt``, Coriolis,
+centrifugal, gravity- and specific-force integrals, and the body-to-ECEF
+quaternion increment) is folded into the per-step control input ``u``,
+and ``F`` is left as the identity.  State propagation therefore reduces
+to ``x_{k+1} = x_k + u_k`` and is exact for any per-step ``dt``; the
+covariance update becomes ``P -> P + Q`` because the F-coupling is no
+longer expressible at construction time.
 
 The propagated state vector is
 
@@ -180,50 +184,16 @@ def rotvec_to_quat(theta):
     ])
 
 
-def _build_transition_matrix(dt, earth_rate, include_centrifugal):
-    """
-    Assemble the 10x10 linear state-transition matrix ``F``.
-
-    The linear, time-invariant pieces of the ECEF strapdown dynamics are
-    baked in:
-
-    * ``p_{k+1} = p_k + v_k * dt``
-    * ``v_{k+1} = v_k - 2 [omega_ie]x v_k * dt``    (Coriolis)
-    * ``v_{k+1} += [omega_ie^2 diag] p_k * dt``     (centrifugal)
-
-    The quaternion block is the identity; the actual body-to-ECEF rotation
-    increment is supplied through the control input ``u``.
-
-    :param dt: IMU sampling interval (s).
-    :type dt: float
-    :param earth_rate: Scalar Earth rotation rate (rad/s).
-    :type earth_rate: float
-    :param include_centrifugal: Include the ``-omega x (omega x p)`` term.
-    :type include_centrifugal: bool
-    :return: 10x10 state-transition matrix.
-    :rtype: numpy.ndarray
-    """
-    f_mat = np.eye(STATE_DIM)
-    f_mat[0:3, 3:6] = np.eye(3) * dt
-    omega_vec = np.array([0.0, 0.0, earth_rate])
-    f_mat[3:6, 3:6] = np.eye(3) - 2.0 * _skew(omega_vec) * dt
-    if include_centrifugal:
-        omega_sq = earth_rate * earth_rate
-        f_mat[3:6, 0:3] = np.diag([omega_sq, omega_sq, 0.0]) * dt
-    return f_mat
-
-
 class InertialKalmanFilter:
     """
     Strapdown Kalman-filter predictor in ECEF, wrapping ``KalmanFilterFp64``.
 
     Each call to :meth:`predict` consumes one IMU sample (delta-velocity and
-    delta-angle in the body frame over ``dt``), composes the corresponding
-    control input ``u``, and delegates the linear propagation to the C++
-    :class:`modmesh.KalmanFilterFp64` instance.
+    delta-angle in the body frame over the supplied ``dt``), composes the
+    corresponding control input ``u``, and delegates the linear propagation
+    to the C++ :class:`modmesh.KalmanFilterFp64` instance.  ``dt`` is a
+    per-call argument so the filter handles non-uniform IMU spacing.
 
-    :ivar dt: Fixed IMU sampling interval (s).
-    :vartype dt: float
     :ivar earth_rate: Earth rotation rate (rad/s).
     :vartype earth_rate: float
     :ivar use_j2: Whether to include the J2 term in the gravity model.
@@ -237,7 +207,6 @@ class InertialKalmanFilter:
     def __init__(
         self,
         initial_state,
-        dt,
         earth_rate=EARTH_RATE,
         process_noise=1.0e-3,
         measurement_noise=1.0,
@@ -246,14 +215,12 @@ class InertialKalmanFilter:
         include_centrifugal=True,
     ):
         """
-        Build the filter around a fixed IMU rate.
+        Build the filter from an initial state.
 
         :param initial_state: Initial 10-element state ``[p, v, q]`` where
             ``q`` is the Breckenridge body-to-ECEF quaternion with scalar
             last.  Must be non-zero in its quaternion slice.
         :type initial_state: numpy.ndarray
-        :param dt: IMU sampling interval in seconds (must be positive).
-        :type dt: float
         :param earth_rate: Scalar Earth rotation rate (rad/s).
         :type earth_rate: float
         :param process_noise: Process noise standard deviation forwarded to
@@ -271,10 +238,6 @@ class InertialKalmanFilter:
         :param include_centrifugal: Include centrifugal acceleration.
         :type include_centrifugal: bool
         """
-        dt = float(dt)
-        if dt <= 0.0:
-            raise ValueError("dt must be strictly positive")
-
         state = np.asarray(initial_state, dtype=float).copy()
         if state.shape != (STATE_DIM,):
             raise ValueError(
@@ -286,14 +249,14 @@ class InertialKalmanFilter:
             raise ValueError("initial quaternion has zero norm")
         state[6:10] /= qnorm
 
-        self.dt = dt
         self.earth_rate = float(earth_rate)
         self.use_j2 = bool(use_j2)
         self.include_centrifugal = bool(include_centrifugal)
 
-        self._f_matrix = _build_transition_matrix(
-            self.dt, self.earth_rate, self.include_centrifugal
-        )
+        # F is the identity because every dt-dependent linear term is
+        # folded into the per-step control input u, allowing the filter
+        # to handle a non-uniform IMU sampling interval.
+        self._f_matrix = np.eye(STATE_DIM)
         self._b_matrix = np.eye(STATE_DIM, CONTROL_DIM)
 
         # A 1x10 zero placeholder H keeps the C++ constructor satisfied;
@@ -379,29 +342,37 @@ class InertialKalmanFilter:
             base * z * (1.0 - c * (5.0 * zr2 - 3.0)),
         ])
 
-    def predict(self, delta_vel_body, delta_angle_body):
+    def predict(self, delta_vel_body, delta_angle_body, dt):
         """
         Run one predict step using IMU delta-velocity and delta-angle.
 
-        The control input passed to the C++ filter is assembled as
+        ``dt`` is supplied per call so the filter accommodates a
+        non-uniform IMU sampling interval -- the time gap between
+        consecutive IMU samples in the BODDL-TP recording is not exactly
+        constant.
 
-            u[0:3] = 0.5 * dt * (dv_ecef + g * dt)
-            u[3:6] = dv_ecef + g * dt
+        With ``F = I``, the entire strapdown mechanization is encoded in
+        the control input:
+
+            u[0:3] = v_k * dt + 0.5 * dt * (dv_ecef + g * dt)
+            u[3:6] = dv_grav - 2 omega_ie x v_k * dt + a_cf * dt
             u[6:10] = q_k (x) dq(delta_theta_eb_body) - q_k
 
         where ``dv_ecef = R_b^e(q_k) @ delta_vel_body`` is the integrated
         specific force rotated into ECEF, ``g`` is the gravity model,
+        ``dv_grav = dv_ecef + g * dt``, ``a_cf`` is the centrifugal
+        acceleration ``[omega^2 p_x, omega^2 p_y, 0]`` (only when
+        :attr:`include_centrifugal`), and
         ``delta_theta_eb_body = delta_angle_body - R_e^b @ omega_ie * dt``
-        is the body-frame rotation increment relative to ECEF (with Earth
-        rotation subtracted), and ``dq`` is the Breckenridge quaternion of
-        that increment.  Adding ``F x_k`` then produces
+        is the body-frame rotation increment relative to ECEF.  Adding
+        ``F x_k = x_k`` then produces
 
             p -> p + v*dt + 0.5 * a_nl * dt^2
             v -> v - 2 omega x v * dt + [centrifugal] * dt + a_nl * dt
             q -> q (x) dq
 
         which is the ECEF strapdown mechanization with gravity, Coriolis,
-        and (optionally) centrifugal acceleration.
+        and (optionally) centrifugal acceleration -- exact for any dt.
 
         :param delta_vel_body: Integrated specific force over ``dt`` in the
             body frame (m/s), shape ``(3,)``.
@@ -409,14 +380,20 @@ class InertialKalmanFilter:
         :param delta_angle_body: Integrated angular rate over ``dt`` in the
             body frame (rad), shape ``(3,)``.
         :type delta_angle_body: numpy.ndarray
+        :param dt: IMU sampling interval for this step (s, must be > 0).
+        :type dt: float
         :return: Updated 10-element state vector (copy).
         :rtype: numpy.ndarray
         """
+        dt = float(dt)
+        if dt <= 0.0:
+            raise ValueError("dt must be strictly positive")
         delta_vel_body = np.asarray(delta_vel_body, dtype=float).reshape(3)
         delta_angle_body = np.asarray(delta_angle_body, dtype=float).reshape(3)
 
         x_k = self.state
         p_k = x_k[0:3]
+        v_k = x_k[3:6]
         q_k = x_k[6:10]
 
         dcm_be = quat_to_dcm(q_k)
@@ -425,15 +402,25 @@ class InertialKalmanFilter:
 
         dv_ecef = dcm_be @ delta_vel_body
         g = self.gravity(p_k)
+        dv_grav = dv_ecef + g * dt
 
-        delta_theta_eb_body = delta_angle_body - dcm_eb @ omega_ie * self.dt
+        coriolis_dv = -2.0 * np.cross(omega_ie, v_k) * dt
+        if self.include_centrifugal:
+            omega_sq = self.earth_rate * self.earth_rate
+            centrifugal_dv = np.array(
+                [omega_sq * p_k[0], omega_sq * p_k[1], 0.0]
+            ) * dt
+        else:
+            centrifugal_dv = np.zeros(3)
+
+        delta_theta_eb_body = delta_angle_body - dcm_eb @ omega_ie * dt
         dq = rotvec_to_quat(delta_theta_eb_body)
         q_new = quat_multiply(q_k, dq)
         q_new /= np.linalg.norm(q_new)
 
         u = np.zeros(CONTROL_DIM)
-        u[0:3] = 0.5 * self.dt * (dv_ecef + g * self.dt)
-        u[3:6] = dv_ecef + g * self.dt
+        u[0:3] = v_k * dt + 0.5 * dt * dv_grav
+        u[3:6] = dv_grav + coriolis_dv + centrifugal_dv
         u[6:10] = q_new - q_k
 
         self.filter.predict(SimpleArrayFloat64(array=u))
@@ -514,11 +501,12 @@ def main():
     """
     Load IMU and ground-truth data, run KF predict, and plot the results.
 
-    The first ground-truth event seeds ``[p, v, q]`` for the filter; ``dt``
-    is derived from the first two IMU timestamps after that seed.  The
-    filter is then propagated through every IMU sample, and the predicted
-    position and velocity in ECEF are plotted against the ground-truth
-    samples encountered along the timeline.
+    The first ground-truth event seeds ``[p, v, q]`` for the filter.  The
+    filter is then propagated through every IMU sample, with ``dt`` for
+    each predict step computed from the gap to the previous IMU timestamp
+    (the BODDL-TP IMU sampling interval is not exactly uniform).  The
+    predicted position and velocity in ECEF are plotted against the
+    ground-truth samples encountered along the timeline.
     """
     import ssl
     import matplotlib.pyplot as plt
@@ -541,18 +529,8 @@ def main():
     if gt_start is None:
         raise RuntimeError("dataset contains no ground-truth events")
 
-    imu_times_ns = [
-        ev.timestamp
-        for ev in dataset_obj.events
-        if ev.source == "imu" and ev.timestamp >= gt_start.timestamp
-    ]
-    if len(imu_times_ns) < 2:
-        raise RuntimeError("not enough IMU samples to estimate dt")
-    dt = (imu_times_ns[1] - imu_times_ns[0]) * 1.0e-9
-
     kf = InertialKalmanFilter(
         initial_state=_initial_state_from_event(gt_start),
-        dt=dt,
     )
 
     t0 = gt_start.timestamp * 1.0e-9
@@ -564,12 +542,17 @@ def main():
     gt_p = [gt_p0]
     gt_v = [gt_v0]
 
+    prev_imu_ns = gt_start.timestamp
     for ev in dataset_obj.events:
         if ev.timestamp < gt_start.timestamp:
             continue
         if ev.source == "imu":
+            dt = (ev.timestamp - prev_imu_ns) * 1.0e-9
+            if dt <= 0.0:
+                continue
             dv, da = _imu_increments(ev)
-            kf.predict(dv, da)
+            kf.predict(dv, da, dt=dt)
+            prev_imu_ns = ev.timestamp
             pred_t.append(ev.timestamp * 1.0e-9 - t0)
             pred_p.append(kf.position.copy())
             pred_v.append(kf.velocity.copy())
