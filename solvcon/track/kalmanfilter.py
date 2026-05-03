@@ -296,15 +296,17 @@ class InertialKalmanFilter:
         )
         self._b_matrix = np.eye(STATE_DIM, CONTROL_DIM)
 
-        # A 1x10 placeholder H keeps the C++ constructor satisfied; the
-        # update step is never invoked by this wrapper.
-        h_mat = np.zeros((1, STATE_DIM))
+        # A 1x10 zero placeholder H keeps the C++ constructor satisfied;
+        # the update step is never invoked by this wrapper.  It is built
+        # from a shape rather than a numpy array because SimpleArray
+        # rejects numpy arrays that have a unit-sized dimension (#603).
+        h_sa = SimpleArrayFloat64([1, STATE_DIM])
 
         self.filter = KalmanFilterFp64(
             x=SimpleArrayFloat64(array=state),
             f=SimpleArrayFloat64(array=self._f_matrix),
             b=SimpleArrayFloat64(array=self._b_matrix),
-            h=SimpleArrayFloat64(array=h_mat),
+            h=h_sa,
             process_noise=float(process_noise),
             measurement_noise=float(measurement_noise),
             jitter=float(jitter),
