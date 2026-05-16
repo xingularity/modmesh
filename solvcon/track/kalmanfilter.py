@@ -71,6 +71,7 @@ __all__ = [
     "WGS84_SEMI_MAJOR",
     "WGS84_J2",
     "DLC_IMU_DCM_CON_IMU",
+    "DLC_IMU_LEVER_ARM_CON",
     "InertialKalmanFilter",
 ]
 
@@ -100,6 +101,16 @@ DLC_IMU_DCM_CON_IMU = np.array([
     [-0.9677, -0.0059, -0.2522],
 ])
 """DCM that rotates a vector in the DLC IMU frame into the CON frame."""
+
+
+# BODDL-TP Flight 1 DLC IMU lever-arm vector, taken verbatim from the
+# dataset README ("pos_IMU_from_CON_in_CON").  This is the position of the
+# IMU sensor relative to CON, expressed in the CON frame.  Because the IMU
+# is offset from CON (dominantly ~1.4 m along -Z_CON), it senses
+# additional tangential and centripetal accelerations whenever the
+# vehicle rotates -- the so-called "lever arm" effect.
+DLC_IMU_LEVER_ARM_CON = np.array([-0.08035, 0.28390, -1.42333])
+"""Position of the DLC IMU in the CON frame, relative to CON (m)."""
 
 
 STATE_DIM = 10
@@ -228,6 +239,7 @@ class InertialKalmanFilter:
         jitter=1.0e-9,
         use_j2=True,
         include_centrifugal=True,
+        lever_arm=None,
     ):
         """
         Build the filter from an initial state.
@@ -252,6 +264,14 @@ class InertialKalmanFilter:
         :type use_j2: bool
         :param include_centrifugal: Include centrifugal acceleration.
         :type include_centrifugal: bool
+        :param lever_arm: Position of the IMU sensor in the body/CON frame
+            relative to the CON reference point (m).  When non-zero, the
+            ``predict`` step subtracts the tangential (``alpha x l``) and
+            centripetal (``omega x (omega x l)``) lever-arm accelerations
+            from the supplied IMU delta-velocity, recovering the
+            equivalent specific force at CON.  ``None`` disables the
+            correction (default).
+        :type lever_arm: numpy.ndarray or None
         """
         state = np.asarray(initial_state, dtype=float).copy()
         if state.shape != (STATE_DIM,):
@@ -267,6 +287,17 @@ class InertialKalmanFilter:
         self.earth_rate = float(earth_rate)
         self.use_j2 = bool(use_j2)
         self.include_centrifugal = bool(include_centrifugal)
+        if lever_arm is None:
+            self.lever_arm = np.zeros(3)
+        else:
+            self.lever_arm = np.asarray(
+                lever_arm, dtype=float,
+            ).reshape(3).copy()
+        # Previous-step body-frame angular rate, used to approximate the
+        # tangential (Euler) lever-arm acceleration alpha x l over each
+        # interval.  Held as ``None`` until the first predict so the first
+        # sample assumes alpha = 0.
+        self._prev_omega_body = None
 
         # F is the identity because every dt-dependent linear term is
         # folded into the per-step control input u, allowing the filter
@@ -405,6 +436,26 @@ class InertialKalmanFilter:
             raise ValueError("dt must be strictly positive")
         delta_vel_body = np.asarray(delta_vel_body, dtype=float).reshape(3)
         delta_angle_body = np.asarray(delta_angle_body, dtype=float).reshape(3)
+
+        # Lever-arm correction: convert the IMU's at-IMU-position specific
+        # force integral into the equivalent integral at CON.  The mean
+        # angular rate over the interval is delta_angle / dt; the change
+        # in angular rate (used for the tangential term) is approximated
+        # by finite differencing against the previous interval.  Angular
+        # rate itself is identical for every point on a rigid body, so no
+        # correction is applied to delta_angle_body.
+        omega = delta_angle_body / dt
+        if np.any(self.lever_arm):
+            if self._prev_omega_body is None:
+                delta_omega = np.zeros(3)
+            else:
+                delta_omega = omega - self._prev_omega_body
+            centripetal = (
+                np.cross(omega, np.cross(omega, self.lever_arm)) * dt
+            )
+            tangential = np.cross(delta_omega, self.lever_arm)
+            delta_vel_body = delta_vel_body - centripetal - tangential
+        self._prev_omega_body = omega
 
         x_k = self.state
         p_k = x_k[0:3]
@@ -549,6 +600,7 @@ def main():
 
     kf = InertialKalmanFilter(
         initial_state=_initial_state_from_event(gt_start),
+        lever_arm=DLC_IMU_LEVER_ARM_CON,
     )
 
     t0 = gt_start.timestamp * 1.0e-9
@@ -587,7 +639,15 @@ def main():
     gt_p = np.asarray(gt_p)
     gt_v = np.asarray(gt_v)
 
-    fig, axes = plt.subplots(3, 2, figsize=(12, 9), sharex=True)
+    # Interpolate predicted position to ground-truth timestamps so the
+    # per-axis error and the magnitude share a common time base.
+    pred_p_on_gt = np.column_stack([
+        np.interp(gt_t, pred_t, pred_p[:, i]) for i in range(3)
+    ])
+    err_p = pred_p_on_gt - gt_p
+    err_p_mag = np.linalg.norm(err_p, axis=1)
+
+    fig, axes = plt.subplots(3, 3, figsize=(16, 9), sharex=True)
     axis_names = ("X", "Y", "Z")
     for i, name in enumerate(axis_names):
         axes[i, 0].plot(
@@ -614,10 +674,29 @@ def main():
         axes[i, 1].grid(True)
         axes[i, 1].legend(loc="best", fontsize=8)
 
+        axes[i, 2].plot(
+            gt_t, err_p[:, i],
+            "g-", linewidth=0.7, label=f"err p_{name}",
+        )
+        axes[i, 2].axhline(0.0, color="k", linewidth=0.5)
+        axes[i, 2].set_ylabel(f"err p_{name} (m)")
+        axes[i, 2].grid(True)
+        axes[i, 2].legend(loc="best", fontsize=8)
+
+    # Overlay the total 3-D position error magnitude on the X-error panel
+    # so the overall trend is visible alongside per-axis behavior.
+    ax_mag = axes[0, 2].twinx()
+    ax_mag.plot(gt_t, err_p_mag, "m--", linewidth=0.7, label="|err p|")
+    ax_mag.set_ylabel("|err p| (m)", color="m")
+    ax_mag.tick_params(axis="y", labelcolor="m")
+    ax_mag.legend(loc="lower right", fontsize=8)
+
     axes[0, 0].set_title("ECEF position")
     axes[0, 1].set_title("ECEF velocity")
+    axes[0, 2].set_title("Position error (predict - truth)")
     axes[2, 0].set_xlabel("time since first ground-truth (s)")
     axes[2, 1].set_xlabel("time since first ground-truth (s)")
+    axes[2, 2].set_xlabel("time since first ground-truth (s)")
     fig.suptitle("KF predict vs. NASA ground truth")
     fig.tight_layout()
     plt.show()
