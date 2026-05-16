@@ -70,6 +70,7 @@ __all__ = [
     "WGS84_GM",
     "WGS84_SEMI_MAJOR",
     "WGS84_J2",
+    "DLC_IMU_DCM_CON_IMU",
     "InertialKalmanFilter",
 ]
 
@@ -85,6 +86,20 @@ WGS84_SEMI_MAJOR = 6378137.0
 
 WGS84_J2 = 1.0826267e-3
 """WGS-84 second zonal harmonic (dimensionless)."""
+
+
+# BODDL-TP Flight 1 DLC IMU mounting alignment, taken verbatim from the
+# dataset README ("att_dcm_CON_IMU").  The DLC IMU sensor frame is rotated
+# relative to the vehicle center-of-navigation (CON) frame, so the raw
+# delta-velocity and delta-angle vectors expressed in the IMU sensor frame
+# must be rotated into CON before they can be fed to a filter whose
+# quaternion (``truth_quat_CON2ECEF``) is defined CON-to-ECEF.
+DLC_IMU_DCM_CON_IMU = np.array([
+    [-0.2477, -0.1673,  0.9543],
+    [-0.0478,  0.9859,  0.1604],
+    [-0.9677, -0.0059, -0.2522],
+])
+"""DCM that rotates a vector in the DLC IMU frame into the CON frame."""
 
 
 STATE_DIM = 10
@@ -453,24 +468,27 @@ def _initial_state_from_event(gt_event):
 
 def _imu_increments(imu_event):
     """
-    Extract delta-velocity and delta-angle vectors from an IMU event.
+    Extract delta-velocity and delta-angle vectors from an IMU event and
+    rotate them from the DLC IMU sensor frame into the vehicle CON frame.
 
     :param imu_event: IMU event reference.
     :type imu_event: modmesh.track.dataset.EventReference
-    :return: Tuple ``(delta_vel_body, delta_angle_body)``.
+    :return: Tuple ``(delta_vel_con, delta_angle_con)`` expressed in CON.
     :rtype: tuple[numpy.ndarray, numpy.ndarray]
     """
     data = imu_event.data
-    dv = np.array([
+    dv_imu = np.array([
         data["DATA_DELTA_VEL[1]"],
         data["DATA_DELTA_VEL[2]"],
         data["DATA_DELTA_VEL[3]"],
     ], dtype=float)
-    da = np.array([
+    da_imu = np.array([
         data["DATA_DELTA_ANGLE[1]"],
         data["DATA_DELTA_ANGLE[2]"],
         data["DATA_DELTA_ANGLE[3]"],
     ], dtype=float)
+    dv = DLC_IMU_DCM_CON_IMU @ dv_imu
+    da = DLC_IMU_DCM_CON_IMU @ da_imu
     return dv, da
 
 
