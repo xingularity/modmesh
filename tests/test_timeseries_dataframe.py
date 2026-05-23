@@ -181,6 +181,12 @@ class TimeSeriesDataFrameTC(unittest.TestCase):
         finally:
             os.unlink(path)
 
+# Theis test is for a bug reported in issue #786:
+# https://github.com/solvcon/modmesh/issues/786
+# Issue #786: If user uses time series dataframe under Linux, 
+# it is likely to be given a `pathlib.PosixPath` instance to 
+# indicate the path to text file. This test is to make sure 
+# dataframe support path which is from `pathlib`
     def test_read_from_text_file_accepts_pathlib_path(self):
         tsdf = dataframe.DataFrame()
         with tempfile.NamedTemporaryFile(
