@@ -181,12 +181,6 @@ class TimeSeriesDataFrameTC(unittest.TestCase):
         finally:
             os.unlink(path)
 
-# Theis test is for a bug reported in issue #786:
-# https://github.com/solvcon/modmesh/issues/786
-# Issue #786: If user uses time series dataframe under Linux,
-# it is likely to be given a `pathlib.PosixPath` instance to
-#  indicate the path to text file. This test is to make sure
-#  dataframe support a path which is from `pathlib`
     def test_read_from_text_file_accepts_pathlib_path(self):
         tsdf = dataframe.DataFrame()
         with tempfile.NamedTemporaryFile(
@@ -204,7 +198,11 @@ class TimeSeriesDataFrameTC(unittest.TestCase):
     def test_read_from_text_file_missing_raises_filenotfound(self):
         tsdf = dataframe.DataFrame()
         missing = pathlib.Path(tempfile.gettempdir()) / 'no_such_file.csv'
-        with self.assertRaises(FileNotFoundError):
+        expected_msg = "Text file '{}' does not exist".format(missing)
+        with self.assertRaises(FileNotFoundError) as ctx:
             tsdf.read_from_text_file(missing)
+        self.assertEqual(str(ctx.exception), expected_msg)
 
-# vim: set ff=unix fenc=utf8 et sw=4 ts=4 sts=4 tw=79:
+        with self.assertRaises(FileNotFoundError) as ctx:
+            tsdf.read_from_text_file(str(missing))
+        self.assertEqual(str(ctx.exception), expected_msg)
