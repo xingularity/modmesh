@@ -15,6 +15,8 @@
 #include <QMenu>
 #include <QAction>
 #include <QActionGroup>
+#include <QVBoxLayout>
+#include <QWidget>
 
 namespace solvcon
 {
@@ -49,6 +51,7 @@ RManager & RManager::setUp()
     {
         this->setUpConsole();
         this->setUpCentral();
+        this->primeRhiComposition();
         this->setUpMenu();
 
         m_already_setup = true;
@@ -65,6 +68,7 @@ void RManager::reset()
     m_core.reset();
     m_mainWindow = nullptr;
     m_fileMenu = nullptr;
+    m_editMenu = nullptr;
     m_viewMenu = nullptr;
     m_oneMenu = nullptr;
     m_meshMenu = nullptr;
@@ -73,6 +77,7 @@ void RManager::reset()
     m_windowMenu = nullptr;
     m_pycon = nullptr;
     m_mdiArea = nullptr;
+    m_rhi_primer = nullptr;
 }
 
 RManager::~RManager()
@@ -80,15 +85,24 @@ RManager::~RManager()
     reset();
 }
 
-R3DWidget * RManager::add3DWidget()
+RDomainWidget * RManager::add3DWidget()
 {
-    R3DWidget * viewer = nullptr;
+    RDomainWidget * viewer = nullptr;
     if (m_mdiArea)
     {
-        viewer = new R3DWidget(/*window*/ nullptr, /*scene*/ nullptr, /*parent*/ m_mdiArea);
-        viewer->setWindowTitle("3D viewer");
-        viewer->show();
-        auto * subwin = this->addSubWindow(viewer);
+        // A QRhiWidget cannot be the direct child of a QMdiSubWindow: nested
+        // there it never reaches a QRhi-flushed backing store, so it logs
+        // "QRhiWidget: No QRhi" and draws nothing, and a second viewer brings
+        // the swapchain down with it (seen on macOS). Host the viewer inside a
+        // plain container widget, which composites correctly and lets several
+        // viewers coexist.
+        auto * host = new QWidget;
+        host->setWindowTitle("Domain viewer");
+        auto * layout = new QVBoxLayout(host);
+        layout->setContentsMargins(0, 0, 0, 0);
+        viewer = new RDomainWidget(/*parent*/ host);
+        layout->addWidget(viewer);
+        auto * subwin = this->addSubWindow(host);
         subwin->resize(400, 300);
     }
     return viewer;
@@ -109,20 +123,37 @@ R2DWidget * RManager::add2DWidget()
     return viewer;
 }
 
-R3DWidget * RManager::currentR3DWidget()
+RDomainWidget * RManager::currentR3DWidget()
 {
     if (m_mdiArea == nullptr)
     {
         return nullptr;
     }
 
-    const auto * subwin = m_mdiArea->currentSubWindow();
+    return domainWidgetOf(m_mdiArea->currentSubWindow());
+}
+
+/// The RDomainWidget hosted by @p subwin, or nullptr when @p subwin holds
+/// some other widget. The viewer sits inside a plain container widget, so
+/// reach through the subwindow's direct child to find it.
+RDomainWidget * RManager::domainWidgetOf(QMdiSubWindow * subwin)
+{
     if (subwin == nullptr)
     {
         return nullptr;
     }
-
-    return dynamic_cast<R3DWidget *>(subwin->widget());
+    QWidget * host = subwin->widget();
+    if (host == nullptr)
+    {
+        return nullptr;
+    }
+    // The host is the container; the viewer is its child. Guard the host
+    // itself too, in case an unwrapped viewer is ever added directly.
+    if (auto * viewer = dynamic_cast<RDomainWidget *>(host))
+    {
+        return viewer;
+    }
+    return host->findChild<RDomainWidget *>();
 }
 
 R2DWidget * RManager::currentR2DWidget()
@@ -181,6 +212,30 @@ void RManager::applyDrawTool()
     }
 }
 
+void RManager::undoCanvas() const
+{
+    auto const * subwin = m_mdiArea ? m_mdiArea->currentSubWindow() : nullptr;
+    auto * canvas = subwin ? dynamic_cast<R2DWidget *>(subwin->widget()) : nullptr;
+    if (canvas == nullptr || canvas->world() == nullptr)
+    {
+        return;
+    }
+    canvas->world()->undo();
+    canvas->requestRepaint();
+}
+
+void RManager::redoCanvas() const
+{
+    auto const * subwin = m_mdiArea ? m_mdiArea->currentSubWindow() : nullptr;
+    auto * canvas = subwin ? dynamic_cast<R2DWidget *>(subwin->widget()) : nullptr;
+    if (canvas == nullptr || canvas->world() == nullptr)
+    {
+        return;
+    }
+    canvas->world()->redo();
+    canvas->requestRepaint();
+}
+
 void RManager::toggleConsole()
 {
     if (m_pycon)
@@ -215,6 +270,21 @@ void RManager::setUpCentral()
                      { applyDrawTool(); });
 }
 
+void RManager::primeRhiComposition()
+{
+    // A QRhiWidget renders to a texture. The first one to appear in the main
+    // window forces Qt to recreate the top-level native window so its backing
+    // store can flush through QRhi; on macOS that tears down and rebuilds every
+    // existing sub-window and dock, so the GUI looks like it restarts and any
+    // already-open viewer vanishes. Trigger that switch once, before any user
+    // content exists, by parking a hidden RDomainWidget in the window. The
+    // recreation then happens with nothing to lose, and later viewers reuse the
+    // same native window. The widget tree owns the primer.
+    m_rhi_primer = new RDomainWidget(m_mdiArea);
+    m_rhi_primer->resize(0, 0);
+    m_rhi_primer->hide();
+}
+
 void RManager::setUpMenu()
 {
     m_mainWindow->setMenuBar(new QMenuBar(nullptr));
@@ -222,6 +292,8 @@ void RManager::setUpMenu()
     // "exited with code -1073740791".  The reason is not yet clarified.
 
     m_fileMenu = m_mainWindow->menuBar()->addMenu(QString("File"));
+    m_editMenu = m_mainWindow->menuBar()->addMenu(QString("Edit"));
+    setUpEditMenuItems();
     m_viewMenu = m_mainWindow->menuBar()->addMenu(QString("View"));
     {
         // Code for controlling camera is not exposed to Python yet
@@ -235,133 +307,144 @@ void RManager::setUpMenu()
     m_windowMenu = m_mainWindow->menuBar()->addMenu(QString("Window"));
 }
 
+void RManager::setUpEditMenuItems() const
+{
+    auto * undo_action = new RAction(
+        QString("Undo"),
+        QString("Undo the last shape drawn on the focused 2D canvas"),
+        [this]()
+        { undoCanvas(); });
+    undo_action->setShortcut(QKeySequence::Undo);
+
+    auto * redo_action = new RAction(
+        QString("Redo"),
+        QString("Redo the last undone shape on the focused 2D canvas"),
+        [this]()
+        { redoCanvas(); });
+    redo_action->setShortcut(QKeySequence::Redo);
+
+    m_editMenu->addAction(undo_action);
+    m_editMenu->addAction(redo_action);
+}
+
 void RManager::setUpCameraControllersMenuItems() const
 {
-    auto * use_orbit_camera = new RAction(
-        QString("Use Orbit Camera Controller"),
-        QString("Use Oribt Camera Controller"),
-        [this]()
+    auto set_mode = [this](std::string const & mode)
+    {
+        for (auto subwin : m_mdiArea->subWindowList())
         {
-            qDebug() << "Use Orbit Camera Controller (menu demo)";
-            for (auto subwin : m_mdiArea->subWindowList())
+            if (auto * viewer = domainWidgetOf(subwin))
             {
-                auto * viewer = dynamic_cast<R3DWidget *>(subwin->widget());
-
-                if (viewer == nullptr)
-                    continue;
-
-                viewer->scene()->setOrbitCameraController();
-                viewer->scene()->controller()->setCamera(viewer->camera());
+                viewer->setCameraMode(mode);
             }
-        });
+        }
+    };
+
+    auto * use_pan_camera = new RAction(
+        QString("Pan / zoom camera (2D)"),
+        QString("Pan and zoom the domain in the plane"),
+        [set_mode]()
+        { set_mode("pan"); });
 
     auto * use_fps_camera = new RAction(
-        QString("Use First Person Camera Controller"),
-        QString("Use First Person Camera Controller"),
-        [this]()
-        {
-            qDebug() << "Use First Person Camera Controller (menu demo)";
-            for (auto subwin : m_mdiArea->subWindowList())
-            {
-                auto * viewer = dynamic_cast<R3DWidget *>(subwin->widget());
+        QString("First-person camera (3D)"),
+        QString("Fly through the domain in first person"),
+        [set_mode]()
+        { set_mode("fps"); });
 
-                if (viewer == nullptr)
-                    continue;
-
-                viewer->scene()->setFirstPersonCameraController();
-                viewer->scene()->controller()->setCamera(viewer->camera());
-            }
-        });
+    auto * use_orbit_camera = new RAction(
+        QString("Orbit camera (3D)"),
+        QString("Orbit the domain around its center"),
+        [set_mode]()
+        { set_mode("orbit"); });
 
     auto * cameraGroup = new QActionGroup(m_mainWindow);
     cameraGroup->addAction(use_orbit_camera);
     cameraGroup->addAction(use_fps_camera);
+    cameraGroup->addAction(use_pan_camera);
 
     use_orbit_camera->setCheckable(true);
     use_fps_camera->setCheckable(true);
+    use_pan_camera->setCheckable(true);
     use_orbit_camera->setChecked(true);
 
-    m_viewMenu->addAction(use_orbit_camera);
-    m_viewMenu->addAction(use_fps_camera);
+    auto * cameraMenu = m_viewMenu->addMenu(QString("Camera"));
+    cameraMenu->addAction(use_orbit_camera);
+    cameraMenu->addAction(use_fps_camera);
+    cameraMenu->addAction(use_pan_camera);
 }
 
 void RManager::setUpCameraMovementMenuItems() const
 {
+    constexpr float pan_step = 40.0f;
+    constexpr float rotate_step = 30.0f;
+    constexpr float zoom_step = 1.0f;
+
     auto * reset_camera = new RAction(
         QString("Reset (esc)"),
         QString("Reset (esc)"),
-        [this]()
-        {
-            const auto * subwin = m_mdiArea->currentSubWindow();
-            if (subwin == nullptr)
-                return;
-
-            auto * viewer = dynamic_cast<R3DWidget *>(subwin->widget());
-            if (viewer == nullptr || viewer->camera() == nullptr)
-                return;
-
-            viewer->cameraController()->reset();
-        });
+        createCameraMovementItemHandler([](RDomainWidget * viewer)
+                                        { viewer->fitCameraToScene(); }));
 
     auto * move_camera_up = new RAction(
         QString("Move camera up (W/UP)"),
         QString("Move camera up (W/UP)"),
-        createCameraMovementItemHandler([](CameraInputState & input)
-                                        { input.tyAxisValue = 1.0; }));
+        createCameraMovementItemHandler([](RDomainWidget * viewer)
+                                        { viewer->panCamera(0.0f, pan_step); }));
 
     auto * move_camera_down = new RAction(
         QString("Move camera down (S/DOWN)"),
         QString("Move camera down (S/DOWN)"),
-        createCameraMovementItemHandler([](CameraInputState & input)
-                                        { input.tyAxisValue = -1.0; }));
+        createCameraMovementItemHandler([](RDomainWidget * viewer)
+                                        { viewer->panCamera(0.0f, -pan_step); }));
 
     auto * move_camera_right = new RAction(
         QString("Move camera right (D/RIGHT)"),
         QString("Move camera right (D/RIGHT)"),
-        createCameraMovementItemHandler([](CameraInputState & input)
-                                        { input.txAxisValue = 1.0; }));
+        createCameraMovementItemHandler([](RDomainWidget * viewer)
+                                        { viewer->panCamera(-pan_step, 0.0f); }));
 
     auto * move_camera_left = new RAction(
         QString("Move camera left (A/LEFT)"),
         QString("Move camera left (A/LEFT)"),
-        createCameraMovementItemHandler([](CameraInputState & input)
-                                        { input.txAxisValue = -1.0; }));
+        createCameraMovementItemHandler([](RDomainWidget * viewer)
+                                        { viewer->panCamera(pan_step, 0.0f); }));
 
     auto * move_camera_forward = new RAction(
         QString("Move camera forward (Ctrl+W/UP)"),
         QString("Move camera forward (Ctrl+W/UP)"),
-        createCameraMovementItemHandler([](CameraInputState & input)
-                                        { input.tzAxisValue = 1.0; }));
+        createCameraMovementItemHandler([](RDomainWidget * viewer)
+                                        { viewer->zoomCamera(zoom_step); }));
 
     auto * move_camera_backward = new RAction(
         QString("Move camera backward (Ctrl+S/DOWN)"),
         QString("Move camera backward (Ctrl+S/DOWN)"),
-        createCameraMovementItemHandler([](CameraInputState & input)
-                                        { input.tzAxisValue = -1.0; }));
+        createCameraMovementItemHandler([](RDomainWidget * viewer)
+                                        { viewer->zoomCamera(-zoom_step); }));
 
     auto * rotate_camera_positive_yaw = new RAction(
         QString("Rotate camera positive yaw"),
         QString("Rotate camera positive yaw"),
-        createCameraMovementItemHandler([](CameraInputState & input)
-                                        { input.rxAxisValue = 1.0; }));
+        createCameraMovementItemHandler([](RDomainWidget * viewer)
+                                        { viewer->rotateCamera(rotate_step, 0.0f); }));
 
     auto * rotate_camera_negative_yaw = new RAction(
         QString("Rotate camera negative yaw"),
         QString("Rotate camera negative yaw"),
-        createCameraMovementItemHandler([](CameraInputState & input)
-                                        { input.rxAxisValue = -1.0; }));
+        createCameraMovementItemHandler([](RDomainWidget * viewer)
+                                        { viewer->rotateCamera(-rotate_step, 0.0f); }));
 
     auto * rotate_camera_positive_pitch = new RAction(
         QString("Rotate camera positive pitch"),
         QString("Rotate camera positive pitch"),
-        createCameraMovementItemHandler([](CameraInputState & input)
-                                        { input.ryAxisValue = 1.0; }));
+        createCameraMovementItemHandler([](RDomainWidget * viewer)
+                                        { viewer->rotateCamera(0.0f, rotate_step); }));
 
     auto * rotate_camera_negative_pitch = new RAction(
         QString("Rotate camera negative pitch"),
         QString("Rotate camera negative pitch"),
-        createCameraMovementItemHandler([](CameraInputState & input)
-                                        { input.ryAxisValue = -1.0; }));
+        createCameraMovementItemHandler([](RDomainWidget * viewer)
+                                        { viewer->rotateCamera(0.0f, -rotate_step); }));
 
     reset_camera->setShortcut(QKeySequence(Qt::Key_Escape));
     reset_camera->setShortcutContext(Qt::WidgetShortcut);
@@ -380,40 +463,18 @@ void RManager::setUpCameraMovementMenuItems() const
     cameraMoveSubmenu->addAction(rotate_camera_negative_pitch);
 }
 
-std::function<void()> RManager::createCameraMovementItemHandler(const std::function<void(CameraInputState &)> & func) const
+std::function<void()> RManager::createCameraMovementItemHandler(const std::function<void(RDomainWidget *)> & func) const
 {
     return [this, func]()
     {
-        const auto * subwin = m_mdiArea->currentSubWindow();
-        if (subwin == nullptr)
-            return;
-
-        auto * viewer = dynamic_cast<R3DWidget *>(subwin->widget());
-        if (viewer == nullptr || viewer->camera() == nullptr)
-            return;
-
-        const auto controllerType = viewer->cameraController()->getType();
-        CameraInputState input{};
-
-        func(input);
-
-        if (input.rxAxisValue != 0.f || input.ryAxisValue != 0.f)
+        if (m_mdiArea == nullptr)
         {
-            if (controllerType == CameraControllerType::Orbit)
-            {
-                constexpr float orbitRotationSpeed = 5.0f;
-
-                input.rxAxisValue *= orbitRotationSpeed;
-                input.ryAxisValue *= orbitRotationSpeed;
-                input.rightMouseButtonActive = true;
-            }
-            else if (controllerType == CameraControllerType::FirstPerson)
-            {
-                input.leftMouseButtonActive = true;
-            }
+            return;
         }
-
-        viewer->cameraController()->moveCamera(input, 0.01);
+        if (auto * viewer = domainWidgetOf(m_mdiArea->currentSubWindow()))
+        {
+            func(viewer);
+        }
     };
 }
 

@@ -40,10 +40,13 @@ runs:
       uses: actions/cache@v5
       with:
         path: ${{ github.workspace }}/Qt
-        key: ${{ runner.os }}-qt-6.8.1-linux_gcc_64
+        # The "-st" suffix tracks the qtshadertools addition; bumping it forces
+        # a clean install so the new module is present rather than masked by a
+        # stale cache.
+        key: ${{ runner.os }}-qt-6.8.1-st-linux_gcc_64
         # fallback to any previous Qt cache on this OS
         restore-keys: |
-          ${{ runner.os }}-qt-6.8.1-
+          ${{ runner.os }}-qt-6.8.1-st-
 
     - name: dependency by apt
       shell: bash
@@ -122,7 +125,9 @@ runs:
         host: 'linux'
         target: 'desktop'
         arch: 'linux_gcc_64'
-        modules: 'qt3d'
+        # qtshadertools provides qsb and the ShaderTools CMake package used to
+        # bake the pilot QRhi shaders.
+        modules: 'qtshadertools'
         setup-python: 'false'
         cache: false
 
@@ -186,11 +191,12 @@ runs:
         clang-format --version
         echo "::endgroup::"
 
-    - name: dependency (manual)
+    - name: install pybind11 (pip wheel)
       shell: bash
       run: |
-        echo "::group::dependency (manual)"
-        sudo ${GITHUB_WORKSPACE}/contrib/dependency/install.sh pybind11
+        echo "::group::install pybind11 (pip wheel)"
+        sudo pip3 install 'pybind11==3.0.1'
+        echo "pybind11_ROOT=$(python3 -c 'import os, pybind11; print(os.path.dirname(pybind11.__file__))')" >> "$GITHUB_ENV"
         echo "::endgroup::"
 
     - name: show dependency

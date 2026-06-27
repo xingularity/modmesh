@@ -8,8 +8,8 @@
 #include <solvcon/pilot/common_detail.hpp> // Must be the first include.
 
 #include <solvcon/pilot/DrawTool.hpp>
+#include <solvcon/pilot/RDomainWidget.hpp>
 #include <solvcon/pilot/R2DWidget.hpp>
-#include <solvcon/pilot/R3DWidget.hpp>
 #include <solvcon/pilot/RAction.hpp>
 #include <solvcon/pilot/RPythonConsoleDockWidget.hpp>
 
@@ -39,9 +39,9 @@ public:
 
     QCoreApplication * core() { return m_core.get(); }
 
-    R3DWidget * add3DWidget();
+    RDomainWidget * add3DWidget();
     R2DWidget * add2DWidget();
-    R3DWidget * currentR3DWidget();
+    RDomainWidget * currentR3DWidget();
     R2DWidget * currentR2DWidget();
     std::vector<R2DWidget *> list2DWidgets();
 
@@ -61,6 +61,7 @@ public:
     QMdiSubWindow * addSubWindow(Args &&... args);
 
     QMenu * fileMenu() { return m_fileMenu; }
+    QMenu * editMenu() { return m_editMenu; }
     QMenu * viewMenu() { return m_viewMenu; }
     QMenu * oneMenu() { return m_oneMenu; }
     QMenu * meshMenu() { return m_meshMenu; }
@@ -83,14 +84,26 @@ private:
     void setUpCentral();
     void setUpMenu();
 
+    /// Park a hidden QRhiWidget in the main window so the top-level adopts
+    /// render-to-texture composition once, up front, before any user content.
+    void primeRhiComposition();
+
     /// Push the active draw tool onto the focused 2D canvas, if any. A
     /// no-op when the focused subwindow is not a 2D canvas.
     void applyDrawTool();
 
+    void setUpEditMenuItems() const;
     void setUpCameraControllersMenuItems() const;
     void setUpCameraMovementMenuItems() const;
 
-    std::function<void()> createCameraMovementItemHandler(const std::function<void(CameraInputState &)> &) const;
+    /// Undo or redo the most recent shape change on the focused 2D canvas,
+    /// then repaint it. A no-op when no 2D canvas is focused.
+    void undoCanvas() const;
+    void redoCanvas() const;
+
+    std::function<void()> createCameraMovementItemHandler(const std::function<void(RDomainWidget *)> &) const;
+
+    static RDomainWidget * domainWidgetOf(QMdiSubWindow * subwin);
 
     bool m_already_setup = false;
 
@@ -99,6 +112,7 @@ private:
     QMainWindow * m_mainWindow = nullptr;
 
     QMenu * m_fileMenu = nullptr;
+    QMenu * m_editMenu = nullptr;
     QMenu * m_viewMenu = nullptr;
     QMenu * m_oneMenu = nullptr;
     QMenu * m_meshMenu = nullptr;
@@ -108,6 +122,10 @@ private:
 
     RPythonConsoleDockWidget * m_pycon = nullptr;
     QMdiArea * m_mdiArea = nullptr;
+
+    /// Hidden QRhiWidget that keeps the main window in render-to-texture
+    /// composition mode for the whole session. Owned by the widget tree.
+    RDomainWidget * m_rhi_primer = nullptr;
 
     /// Active canvas drawing tool, shared by every 2D canvas. Starts on
     /// the default tool (pan navigation).

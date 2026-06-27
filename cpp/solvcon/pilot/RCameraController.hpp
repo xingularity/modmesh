@@ -1,213 +1,107 @@
 #pragma once
 
 /*
- * Copyright (c) 2022, solvcon team <contact@solvcon.net>
+ * Copyright (c) 2025, solvcon team <contact@solvcon.net>
  * BSD 3-Clause License, see COPYING
  */
 
 #include <solvcon/pilot/common_detail.hpp> // Must be the first include.
-#include <QCamera>
-#include <QAbstractCameraController>
 
-#include <Qt3DLogic/QFrameAction>
-#include <Qt3DInput/QActionInput>
-#include <Qt3DInput/QAction>
-#include <Qt3DInput/QAnalogAxisInput>
-#include <Qt3DInput/QButtonAxisInput>
-#include <Qt3DInput/QAxis>
-#include <Qt3DInput/QLogicalDevice>
+#include <QMatrix4x4>
+#include <QVector3D>
+
+#include <string>
 
 namespace solvcon
 {
 
-struct CameraInputState
+/**
+ * @brief A single camera controller with three interaction modes.
+ *
+ * PanZoom frames a 2D domain head-on: dragging pans and the wheel zooms an
+ * orthographic view. FirstPerson flies through a 3D domain: dragging looks
+ * around and the wheel dollies along the view direction. Orbit inspects a 3D
+ * domain from outside: dragging swings the eye around the fixed target and the
+ * wheel dollies toward it, the up axis held fixed so the view never rolls (a
+ * turntable orbit). The controller holds one pose (position, target, up) plus
+ * an orthographic zoom factor, and feeds a QMatrix4x4 view matrix.
+ *
+ * The widget drives the controller from mouse and key events, and Python
+ * drives the same primitives (rotate / zoom / pan) and reads or sets the pose
+ * directly, so the domain navigates the same way from code as from the mouse.
+ */
+class RCameraController
 {
-    float rxAxisValue = 0;
-    float ryAxisValue = 0;
-    float txAxisValue = 0;
-    float tyAxisValue = 0;
-    float tzAxisValue = 0;
-
-    bool leftMouseButtonActive = false;
-    bool middleMouseButtonActive = false;
-    bool rightMouseButtonActive = false;
-
-    bool altKeyActive = false;
-    bool shiftKeyActive = false;
-}; /* end struct CameraInputState */
-
-enum class CameraControllerType
-{
-    FirstPerson,
-    Orbit
-};
-
-class RCameraInputListener : public Qt3DCore::QEntity
-{
-    Q_OBJECT
 
 public:
-    using callback_type = std::function<void(const CameraInputState &, float)>;
 
-    RCameraInputListener(
-        Qt3DInput::QKeyboardDevice * keyboardDevice,
-        Qt3DInput::QMouseDevice * mouseDevice,
-        callback_type callback,
-        QNode * parent = nullptr);
-
-private:
-
-    void init();
-
-    void initMouseListeners() const;
-
-    void initKeyboardListeners() const;
-
-    Qt3DLogic::QFrameAction * m_frame_action;
-    Qt3DInput::QLogicalDevice * m_logical_device;
-    Qt3DInput::QKeyboardDevice * m_keyboard_device;
-    Qt3DInput::QMouseDevice * m_mouse_device;
-    // invoked each frame to update the camera position
-    callback_type m_callback;
-    // rotation
-    Qt3DInput::QAxis * m_rx_axis;
-    Qt3DInput::QAxis * m_ry_axis;
-    // translation
-    Qt3DInput::QAxis * m_tx_axis;
-    Qt3DInput::QAxis * m_ty_axis;
-    Qt3DInput::QAxis * m_tz_axis;
-    Qt3DInput::QAction * m_left_mouse_button_action;
-    Qt3DInput::QAction * m_middle_mouse_button_action;
-    Qt3DInput::QAction * m_right_mouse_button_action;
-    Qt3DInput::QAction * m_shift_button_action;
-    Qt3DInput::QAction * m_alt_button_action;
-    Qt3DInput::QAction * m_ctrl_button_action;
-    Qt3DInput::QActionInput * m_left_mouse_button_input;
-    Qt3DInput::QActionInput * m_middle_mouse_button_input;
-    Qt3DInput::QActionInput * m_right_mouse_button_input;
-    Qt3DInput::QActionInput * m_shift_button_input;
-    Qt3DInput::QActionInput * m_alt_button_input;
-    Qt3DInput::QActionInput * m_ctrl_button_input;
-    // mouse rotation input
-    Qt3DInput::QAnalogAxisInput * m_mouse_rx_input;
-    Qt3DInput::QAnalogAxisInput * m_mouse_ry_input;
-    // mouse translation input (wheel)
-    Qt3DInput::QAnalogAxisInput * m_mouse_tz_x_input;
-    Qt3DInput::QAnalogAxisInput * m_mouse_tz_y_input;
-    // keyboard translation input
-    Qt3DInput::QButtonAxisInput * m_keyboard_tx_pos_input;
-    Qt3DInput::QButtonAxisInput * m_keyboard_ty_pos_input;
-    Qt3DInput::QButtonAxisInput * m_keyboard_tz_pos_input;
-    Qt3DInput::QButtonAxisInput * m_keyboard_tx_neg_input;
-    Qt3DInput::QButtonAxisInput * m_keyboard_ty_neg_input;
-    Qt3DInput::QButtonAxisInput * m_keyboard_tz_neg_input;
-}; /* end class RCameraInputListener */
-
-class RCameraController : public Qt3DExtras::QAbstractCameraController
-{
-    Q_OBJECT
-
-public:
-    explicit RCameraController(Qt3DCore::QNode * parent = nullptr)
-        : QAbstractCameraController(parent)
+    enum class Mode
     {
-    }
+        PanZoom, ///< 2D: drag pans, wheel zooms the orthographic box.
+        FirstPerson, ///< 3D: drag looks around, wheel dollies forward.
+        Orbit, ///< 3D: drag swings the eye around the target, wheel dollies in.
+    };
 
-    void moveCamera(const InputState & state, float dt) override
-    {
-        // Do nothing in QAbstractCameraController's moveCamera
-    }
+    void setMode(Mode mode) { m_mode = mode; }
+    Mode mode() const { return m_mode; }
 
-    virtual void moveCamera(const CameraInputState & state, float dt) = 0;
+    static Mode modeFromName(std::string const & name);
+    static std::string modeName(Mode mode);
 
-    Qt3DRender::QCamera * camera() const { return QAbstractCameraController::camera(); }
-    void setCamera(Qt3DRender::QCamera * camera) { QAbstractCameraController::setCamera(camera); }
+    /// Frame the camera onto the bounding box [lo, hi] for an @p ndim domain
+    /// at the given viewport @p aspect (width / height).
+    void fitToBoundingBox(QVector3D const & lo, QVector3D const & hi, uint32_t ndim, float aspect);
 
-    float linearSpeed() const { return QAbstractCameraController::linearSpeed(); }
-    void setLinearSpeed(float value) { QAbstractCameraController::setLinearSpeed(value); }
+    /// The view matrix for the current pose.
+    QMatrix4x4 viewMatrix() const;
 
-    float lookSpeed() const { return QAbstractCameraController::lookSpeed(); }
-    void setLookSpeed(float value) { QAbstractCameraController::setLookSpeed(value); }
+    /// The orthographic zoom factor (smaller means zoomed in).
+    float orthoScale() const { return m_ortho_scale; }
 
-    virtual CameraControllerType getType() = 0;
+    /// Drag interaction: pan in PanZoom, look around in FirstPerson, swing the
+    /// eye around the target in Orbit. @p dx and @p dy are pixel deltas.
+    void rotate(float dx, float dy);
 
-    QVector3D position() const { return camera()->position(); }
-    void setPosition(const QVector3D & value) const { camera()->setPosition(value); }
+    /// Pan the view in its own plane by the pixel deltas (both modes).
+    void pan(float dx, float dy);
 
-    QVector3D viewVector() const { return camera()->viewVector(); }
+    /// Wheel interaction: change the orthographic zoom in PanZoom, dolly along
+    /// the view direction in FirstPerson, dolly toward the target in Orbit.
+    /// @p steps is the wheel notch count.
+    void zoom(float steps);
 
-    QVector3D viewCenter() const { return camera()->viewCenter(); }
-    void setViewCenter(const QVector3D & value) const { camera()->setViewCenter(value); }
+    /// Pinch interaction: zoom by a multiplicative @p factor (greater than 1
+    /// zooms in, less than 1 zooms out), as a trackpad or touch pinch reports.
+    /// Maps onto the same zoom path as the wheel.
+    void pinch(float factor);
 
-    QVector3D upVector() const { return camera()->upVector(); }
-    void setUpVector(const QVector3D & value) const { camera()->setUpVector(value); }
+    /// Move along the view direction (forward, +) or sideways (strafe, +right)
+    /// by a fraction of the scene size; used by the first-person keys.
+    void moveForward(float amount);
+    void moveRight(float amount);
 
-    float farPlane() const { return camera()->farPlane(); }
-    void setFarPlane(float value) const { camera()->setFarPlane(value); }
-
-    void reset();
-
-    QVector3D defaultPosition() const { return m_default_position; }
-    void setDefaultPosition(QVector3D value) { m_default_position = value; }
-
-    QVector3D defaultViewCenter() const { return m_default_view_center; }
-    void setDefaultViewCenter(QVector3D value) { m_default_view_center = value; }
-
-    QVector3D defaultUpVector() const { return m_default_up_vector; }
-    void setDefaultUpVector(QVector3D value) { m_default_up_vector = value; }
-
-    float defaultLinearSpeed() const { return m_default_linear_speed; }
-    void setDefaultLinearSpeed(float value) { m_default_linear_speed = value; }
-
-    float defaultLookSpeed() const { return m_default_look_speed; }
-    void setDefaultLookSpeed(float value) { m_default_look_speed = value; }
-
-protected:
-    RCameraInputListener * m_listener = nullptr;
+    QVector3D position() const { return m_position; }
+    void setPosition(QVector3D const & position) { m_position = position; }
+    QVector3D target() const { return m_target; }
+    void setTarget(QVector3D const & target) { m_target = target; }
+    QVector3D up() const { return m_up; }
+    void setUp(QVector3D const & up) { m_up = up; }
 
 private:
-    QVector3D m_default_position = QVector3D(0.0f, 0.0f, 10.0f);
-    QVector3D m_default_view_center = QVector3D(0.0f, 0.0f, 0.0f);
-    QVector3D m_default_up_vector = QVector3D(0.0f, 1.0f, 0.0f);
-    float m_default_linear_speed = 50.0f;
-    float m_default_look_speed = 180.0f;
-}; /* end class CameraController */
 
-class RFirstPersonCameraController : public RCameraController
-{
-    Q_OBJECT
+    QVector3D forward() const;
+    QVector3D rightAxis() const;
 
-public:
-    explicit RFirstPersonCameraController(QNode * parent = nullptr);
+    Mode m_mode = Mode::Orbit; ///< Default; a 2D domain switches to PanZoom.
 
-private:
-    static constexpr auto lookSpeedFactorOnShiftPressed = 0.2f;
+    QVector3D m_position{0.0f, 0.0f, 1.0f};
+    QVector3D m_target{0.0f, 0.0f, 0.0f};
+    QVector3D m_up{0.0f, 1.0f, 0.0f};
 
-    void moveCamera(const CameraInputState & input, float dt) override;
+    float m_ortho_scale = 1.0f; ///< PanZoom zoom factor.
+    float m_radius = 1.0f; ///< Scene scale, sets pan and dolly speeds.
 
-    CameraControllerType getType() override { return CameraControllerType::FirstPerson; }
-}; /* end class RFirstPersonCameraController */
-
-class ROrbitCameraController : public RCameraController
-{
-    Q_OBJECT
-
-public:
-    explicit ROrbitCameraController(QNode * parent = nullptr);
-
-private:
-    void moveCamera(const CameraInputState & input, float dt) override;
-
-    void zoom(float zoomValue) const;
-
-    void orbit(float pan, float tilt) const;
-
-    static float clamp(float value);
-
-    static float zoomDistanceSquared(QVector3D firstPoint, QVector3D secondPoint);
-
-    CameraControllerType getType() override { return CameraControllerType::Orbit; }
-}; /* end class ROrbitCameraController */
+}; /* end class RCameraController */
 
 } /* end namespace solvcon */
 
